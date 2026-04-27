@@ -6,8 +6,8 @@ A real-time speech recognition server that accepts streaming audio
 via WebSocket and returns transcribed text using SenseVoiceSmall.
 
 Architecture:
-  Client → WebSocket (binary PCM chunks) → VAD (silero-vad)
-    → Speech Segment Detected → SenseVoiceSmall → Text Result → WebSocket → Client
+  Client -> WebSocket (binary PCM chunks) -> VAD (silero-vad)
+    -> Speech Segment Detected -> SenseVoiceSmall -> Text Result -> WebSocket -> Client
 
 Usage:
   python server.py --host 0.0.0.0 --port 8765
@@ -24,6 +24,10 @@ EOF Protocol:
   Client sends {"action": "eof"} to immediately transcribe buffered audio
   without waiting for VAD silence detection. Useful for push-to-talk apps
   where the user releases the button to indicate end-of-speech.
+
+  Fallback: If VAD already triggered speech_end (600ms of silence), only
+  residual audio (< 50ms) remains in the buffer. In that case, the last
+  VAD-triggered transcription result is re-sent as the final result.
 
 Requirements:
   - funasr
@@ -106,7 +110,6 @@ class SenseVoiceEngine:
         t0 = time.time()
 
         # Write to temp file (FunASR generate() requires file path)
-        # Using tmpfs to avoid disk I/O
         tmp_path = f'/dev/shm/_sensevoice_tmp_{id(audio_bytes)}.wav'
         try:
             self._write_wav(tmp_path, audio_bytes, sample_rate)
@@ -157,6 +160,10 @@ class AudioSession:
         self.buffer = bytearray()
         self.samples_accumulated = 0
         self.total_audio_ms = 0
+        # Stores the last VAD-triggered transcription result.
+        # When EOF arrives and VAD has already triggered speech_end (leaving
+        # only residual audio < 50ms), this result is re-sent.
+        self.last_vad_result = None
 
     def reset(self):
         """Reset VAD and audio buffer for a new utterance."""
@@ -164,6 +171,7 @@ class AudioSession:
         self.buffer.clear()
         self.samples_accumulated = 0
         self.total_audio_ms = 0
+        # Do NOT clear last_vad_result — persists for EOF fallback
 
     async def feed_audio(self, chunk: bytes):
         """
@@ -185,18 +193,24 @@ class AudioSession:
 
             if event['event'] == 'speech_end':
                 audio = event['buffer']
+                logger.info(f"VAD speech_end: transcribing {len(audio)} bytes ({len(audio)/2/self.sample_rate:.2f}s)")
                 transcription = self.engine.transcribe(
                     audio,
                     language=self.language,
                     sample_rate=self.sample_rate
                 )
                 if transcription['text']:
-                    results.append({
+                    result = {
                         'type': 'transcription',
                         'text': transcription['text'],
                         'duration_sec': transcription['duration_sec'],
                         'inference_ms': transcription['inference_ms'],
-                    })
+                    }
+                    # Save for EOF fallback
+                    self.last_vad_result = result
+                    results.append(result)
+                else:
+                    logger.info("VAD speech_end: no text in transcription")
             elif event['event'] == 'speech_start':
                 results.append({'type': 'speech_start'})
 
@@ -207,44 +221,63 @@ class AudioSession:
         Immediately transcribe all buffered audio (triggered by EOF signal).
         Bypasses VAD grace period — returns result right away.
 
+        - If substantial buffered audio (> 50ms / 1600 bytes), transcribe fresh.
+        - If only residual audio (<= 50ms) remains (VAD already triggered
+          speech_end), falls back to last_vad_result.
+        - If nothing available, returns None.
+
         Returns:
-            dict with transcription result, or None if audio is too short.
+            dict with transcription result, or None if nothing available.
         """
         # Collect remaining partial VAD frame + any speech buffer
         partial_frame = bytes(self.buffer)
         self.buffer.clear()
-
         speech_audio = self.vad.force_flush()
-
         full_audio = partial_frame + speech_audio
 
-        if not full_audio or len(full_audio) < 320:
-            return None
+        MIN_EOF_AUDIO_BYTES = 1600  # 50ms of 16kHz PCM
 
-        transcription = self.engine.transcribe(
-            full_audio,
-            language=self.language,
-            sample_rate=self.sample_rate
-        )
-        if transcription['text']:
-            return {
-                'type': 'transcription',
-                'text': transcription['text'],
-                'duration_sec': transcription['duration_sec'],
-                'inference_ms': transcription['inference_ms'],
-            }
+        if full_audio and len(full_audio) >= MIN_EOF_AUDIO_BYTES:
+            logger.info(f"force_transcribe: transcribing {len(full_audio)} bytes ({len(full_audio)/2/self.sample_rate:.2f}s)")
+            transcription = self.engine.transcribe(
+                full_audio,
+                language=self.language,
+                sample_rate=self.sample_rate
+            )
+            if transcription['text']:
+                return {
+                    'type': 'transcription',
+                    'text': transcription['text'],
+                    'duration_sec': transcription['duration_sec'],
+                    'inference_ms': transcription['inference_ms'],
+                }
+
+        # Audio too short or no text — fall back to VAD result
+        if self.last_vad_result:
+            logger.info(f"force_transcribe: residual audio ({len(full_audio) if full_audio else 0} bytes), "
+                        f"re-sending last VAD result: '{self.last_vad_result['text']}'")
+            return self.last_vad_result
+
+        logger.info("force_transcribe: no audio and no VAD result available")
         return None
 
     def flush(self):
         """Process any remaining audio (on connection close)."""
-        if len(self.buffer) >= 320:
-            audio = bytes(self.buffer)
+        # Collect all remaining audio (same logic as force_transcribe)
+        partial_frame = bytes(self.buffer)
+        self.buffer.clear()
+        speech_audio = self.vad.force_flush()
+        full_audio = partial_frame + speech_audio
+
+        MIN_EOF_AUDIO_BYTES = 1600
+
+        if full_audio and len(full_audio) >= MIN_EOF_AUDIO_BYTES:
+            logger.info(f"flush: transcribing {len(full_audio)} bytes on disconnect")
             transcription = self.engine.transcribe(
-                audio,
+                full_audio,
                 language=self.language,
                 sample_rate=self.sample_rate
             )
-            self.buffer.clear()
             if transcription['text']:
                 return [{
                     'type': 'transcription',
@@ -252,6 +285,11 @@ class AudioSession:
                     'duration_sec': transcription['duration_sec'],
                     'inference_ms': transcription['inference_ms'],
                 }]
+
+        if self.last_vad_result:
+            logger.info(f"flush: re-sending last VAD result: '{self.last_vad_result['text']}'")
+            return [self.last_vad_result]
+
         return []
 
 
@@ -317,13 +355,22 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
                         await websocket.send(json.dumps({'type': 'info', 'message': 'Session reset'}))
 
                     elif action == 'eof':
+                        t_eof = time.perf_counter()
                         # Force transcribe buffered audio immediately
                         result = await session.force_transcribe()
+                        elapsed_ms = (time.perf_counter() - t_eof) * 1000
                         if result:
+                            logger.info(f"EOF result: '{result['text']}' "
+                                        f"(server_time={elapsed_ms:.1f}ms, "
+                                        f"inference={result['inference_ms']}ms)")
                             await websocket.send(json.dumps(result, ensure_ascii=False))
+                        else:
+                            logger.info(f"EOF result: no transcription available "
+                                        f"(server_time={elapsed_ms:.1f}ms)")
                         # Signal that EOF processing is complete
                         await websocket.send(json.dumps({'type': 'done'}))
-                        # Reset for next utterance
+                        logger.info(f"Sent 'done' to {client_id} (total={elapsed_ms:.1f}ms)")
+                        # Reset for next utterance (preserves last_vad_result)
                         session.reset()
 
                 except json.JSONDecodeError:

@@ -21,12 +21,16 @@ class VoiceActivityDetector:
     State machine:
       SILENT → (speech detected) → SPEAKING
       SPEAKING → (silence > grace_period) → GRACE → emit event → SILENT
+    
+    In PTT (push-to-talk) mode, the VAD will NOT auto-trigger speech_end.
+    Speech end is only triggered by explicit EOF command from client.
     """
 
-    def __init__(self, sample_rate: int = 16000, grace_period_ms: int = 600, threshold: float = 0.5):
+    def __init__(self, sample_rate: int = 16000, grace_period_ms: int = 600, threshold: float = 0.5, ptt_mode: bool = False):
         self.sample_rate = sample_rate
         self.grace_frames = int(sample_rate / 512 * grace_period_ms / 1000)  # silero uses 512-frame windows
         self.threshold = threshold
+        self.ptt_mode = ptt_mode
 
         self.model, _ = torch.hub.load(
             repo_or_dir='snakers4/silero-vad',
@@ -65,7 +69,7 @@ class VoiceActivityDetector:
           - {'event': 'silence'}
           - {'event': 'speech_start'}
           - {'event': 'speaking', 'buffer': accumulated_audio}
-          - {'event': 'speech_end', 'buffer': accumulated_audio}
+          - {'event': 'speech_end', 'buffer': accumulated_audio}  (only in non-PTT mode)
           - {'event': 'error', 'message': ...}
         """
         # Convert bytes to numpy
@@ -94,7 +98,8 @@ class VoiceActivityDetector:
                 return {'event': 'speaking', 'buffer': b''.join(self.speech_buffer)}
             else:
                 self.silent_count += 1
-                if self.silent_count >= self.grace_frames:
+                # In PTT mode, never auto-trigger speech_end
+                if not self.ptt_mode and self.silent_count >= self.grace_frames:
                     full_audio = b''.join(self.speech_buffer)
                     self.reset()
                     return {'event': 'speech_end', 'buffer': full_audio}

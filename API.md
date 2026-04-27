@@ -1,6 +1,6 @@
 # SenseVoice WebSocket ASR Server — API Reference
 
-Version 1.0 | Protocol: WebSocket | Audio: PCM 16kHz 16-bit Mono
+Version 1.1 | Protocol: WebSocket | Audio: PCM 16kHz 16-bit Mono
 
 ---
 
@@ -129,10 +129,14 @@ The client can use this signal to update UI (e.g., show a listening indicator).
 
 Sent when VAD detects the end of a speech segment and ASR completes.
 
+**⚠️ Important — Raw Output Format**: The `text` field is returned **exactly** as output by the SenseVoiceSmall model, without post-processing. It may contain special tags that must be stripped by the client.
+
+**Example — actual server response:**
+
 ```json
 {
   "type": "transcription",
-  "text": "请问信用卡的授信额度通常是多少",
+  "text": "<|zh|><|NEUTRAL|><|Speech|><|woitn|>在吗在吗看现在这个识别对不对",
   "duration_sec": 2.34,
   "inference_ms": 45.6
 }
@@ -140,13 +144,58 @@ Sent when VAD detects the end of a speech segment and ASR completes.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `text` | string | Recognized text output (raw, no formatting applied) |
+| `text` | string | Raw ASR output from SenseVoiceSmall (includes special tags, see below) |
 | `duration_sec` | number | Audio duration of this utterance in seconds |
 | `inference_ms` | number | Model inference time in milliseconds |
 
-Notes:
+**Special Tags in `text`:**
+
+The `text` field is prefixed with SenseVoiceSmall's task/language/emotion tags. The client must strip these before displaying the final text.
+
+| Tag | Meaning | Notes |
+|-----|---------|-------|
+| `<\|zh\|>` | Language: Chinese | Also: `<\|en\|>`, `<\|yue\|>`, `<\|ja\|>`, `<\|ko\|>` |
+| `<\|NEUTRAL\|>` | Emotion: neutral | Also: `<\|HAPPY\|>`, `<\|SAD\|>`, `<\|ANGRY\|>` |
+| `<\|Speech\|>` | Modality: speech | Fixed tag, always present for voice input |
+| `<\|woitn\|>` | Without ITN | Indicates raw output without inverse text normalization |
+| `<\|withitn\|>` | With ITN | Present when `use_itn=True` (server default is `False`) |
+
+**Client-side stripping (recommended):**
+
+```javascript
+// JavaScript — strip SenseVoice tags from text
+function cleanSenseVoiceText(raw) {
+  return raw.replace(/<\|[a-zA-Z_]+\|>/g, '').trim();
+}
+
+// Usage
+const text = cleanSenseVoiceText(msg.text);
+// "在吗在吗看现在这个识别对不对"
+```
+
+```python
+# Python — strip SenseVoice tags from text
+import re
+
+def clean_sensevoice_text(raw: str) -> str:
+    return re.sub(r'<\|[a-zA-Z_]+\|>', '', raw).strip()
+```
+
+```swift
+// Swift — strip SenseVoice tags from text
+func cleanSenseVoiceText(_ raw: String) -> String {
+    return raw.replacingOccurrences(
+        of: #"<\|[a-zA-Z_]+\|>"#,
+        with: "",
+        options: .regularExpression
+    ).trimmingCharacters(in: .whitespaces)
+}
+```
+
+**Notes:**
 - The output text is raw ASR output without inverse text normalization (ITN). Numbers and punctuation are passed as-is, intended for downstream LLM processing.
 - If the utterance contains no detectable speech, no `transcription` message is sent.
+- The server does **not** strip these tags — it is the client's responsibility to clean the `text` field before display.
 
 ### 4.4 `error`
 
@@ -166,6 +215,11 @@ Notes:
 ```javascript
 const ws = new WebSocket('ws://server:8765/?language=zh');
 
+// Strip SenseVoice tags helper
+function cleanText(raw) {
+  return raw.replace(/<\|[a-zA-Z_]+\|>/g, '').trim();
+}
+
 ws.onopen = () => {
   console.log('Connected');
 };
@@ -177,7 +231,9 @@ ws.onmessage = (event) => {
   if (msg.type === 'speech_start') {
     console.log('Listening...');
   } else if (msg.type === 'transcription') {
-    console.log('Recognized:', msg.text);
+    // Clean the raw text before displaying
+    const text = cleanText(msg.text);
+    console.log('Recognized:', text);
   }
 };
 
@@ -193,8 +249,12 @@ navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
 ```python
 import asyncio
 import json
+import re
 import websockets
 import pyaudio
+
+def clean_sensevoice_text(raw: str) -> str:
+    return re.sub(r'<\|[a-zA-Z_]+\|>', '', raw).strip()
 
 async def microphone_client():
     async with websockets.connect(
@@ -222,7 +282,8 @@ async def microphone_client():
                 if data['type'] == 'speech_start':
                     print("[listening...]", end=" ", flush=True)
                 elif data['type'] == 'transcription':
-                    print(f"\n[{data['text']}]")
+                    text = clean_sensevoice_text(data['text'])
+                    print(f"\n[{text}]")
 
         await asyncio.gather(send_audio(), recv_results())
 ```

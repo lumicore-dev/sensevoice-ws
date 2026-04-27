@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SenseVoice ASR WebSocket Server
+SenseVoice WebSocket ASR Server
 
 A real-time speech recognition server that accepts streaming audio
 via WebSocket and returns transcribed text using SenseVoiceSmall.
@@ -11,6 +11,12 @@ Architecture:
 
 Usage:
   python server.py --host 0.0.0.0 --port 8765
+
+Clients can specify language via URL query string:
+  ws://host:8765/?language=zh
+  ws://host:8765/?language=en
+  ws://host:8765/?language=yue
+  ws://host:8765/?language=auto
 
 Requirements:
   - funasr
@@ -26,13 +32,12 @@ import logging
 import os
 import argparse
 import time
-import struct
-from pathlib import Path
+from urllib.parse import urlparse, parse_qs
 
 import websockets
 import numpy as np
 
-from vad.vad import VoiceActivityDetector, VADState
+from vad.vad import VoiceActivityDetector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -40,6 +45,9 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger('sensevoice-ws')
+
+# Supported language codes
+SUPPORTED_LANGUAGES = {'zh', 'en', 'yue', 'ja', 'ko', 'auto'}
 
 # ---------------------------------------------------------------------------
 # ASR Engine
@@ -51,11 +59,9 @@ class SenseVoiceEngine:
     Loaded once and shared across all connections.
     """
 
-    def __init__(self, model_dir: str = None, device: str = 'cuda:0', use_itn: bool = True):
+    def __init__(self, model_dir: str = None, device: str = 'cuda:0'):
         self.device = device
-        self.use_itn = use_itn
         self.model = None
-        self.postprocess = None
         self.model_dir = model_dir or os.environ.get(
             'SENSEVOICE_MODEL_DIR',
             '/home/zhyi/.cache/modelscope/hub/iic/SenseVoiceSmall'
@@ -65,7 +71,6 @@ class SenseVoiceEngine:
     def _load_model(self):
         logger.info(f"Loading SenseVoiceSmall from {self.model_dir} on {self.device} ...")
         from funasr import AutoModel
-        from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
         self.model = AutoModel(
             model=self.model_dir,
@@ -73,38 +78,37 @@ class SenseVoiceEngine:
             device=self.device,
             disable_update=True,
         )
-        self.postprocess = rich_transcription_postprocess
         logger.info("SenseVoiceSmall loaded successfully")
 
-    def transcribe(self, audio_bytes: bytes, sample_rate: int = 16000) -> dict:
+    def transcribe(self, audio_bytes: bytes, language: str = 'zh', sample_rate: int = 16000) -> dict:
         """
         Run ASR on raw PCM audio bytes.
-        
+
         Args:
             audio_bytes: Raw PCM 16-bit mono audio data
+            language: Language code (zh, en, yue, ja, ko, auto)
             sample_rate: Audio sample rate (must match model expected rate)
-            
+
         Returns:
-            dict with 'text', 'raw_text', 'duration_sec', 'inference_ms'
+            dict with 'text', 'duration_sec', 'inference_ms'
         """
         if not audio_bytes or len(audio_bytes) < 320:  # < 10ms audio
-            return {'text': '', 'raw_text': '', 'duration_sec': 0, 'inference_ms': 0}
+            return {'text': '', 'duration_sec': 0, 'inference_ms': 0}
 
         duration_sec = len(audio_bytes) / 2 / sample_rate
         t0 = time.time()
 
         # Write to temp file (FunASR generate() requires file path)
-        # Using /dev/shm to avoid disk I/O
+        # Using tmpfs to avoid disk I/O
         tmp_path = f'/dev/shm/_sensevoice_tmp_{id(audio_bytes)}.wav'
         try:
             self._write_wav(tmp_path, audio_bytes, sample_rate)
             res = self.model.generate(
                 input=tmp_path,
-                language='zh',
-                use_itn=self.use_itn,
+                language=language,
+                use_itn=False,
             )
-            raw_text = res[0]['text']
-            text = self.postprocess(raw_text) if self.postprocess else raw_text
+            text = res[0]['text'].strip()
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -113,7 +117,6 @@ class SenseVoiceEngine:
 
         return {
             'text': text,
-            'raw_text': raw_text,
             'duration_sec': round(duration_sec, 2),
             'inference_ms': round(inference_ms, 1),
         }
@@ -139,8 +142,9 @@ class AudioSession:
     Accumulates chunks and runs VAD + ASR.
     """
 
-    def __init__(self, engine: SenseVoiceEngine, sample_rate: int = 16000):
+    def __init__(self, engine: SenseVoiceEngine, language: str = 'zh', sample_rate: int = 16000):
         self.engine = engine
+        self.language = language
         self.sample_rate = sample_rate
         self.vad = VoiceActivityDetector(sample_rate=sample_rate)
         self.buffer = bytearray()
@@ -152,7 +156,7 @@ class AudioSession:
         Feed incoming audio chunk. Returns list of result events.
         """
         self.buffer.extend(chunk)
-        self.samples_accumulated += len(chunk) // 2  # 16-bit = 2 bytes/sample
+        self.samples_accumulated += len(chunk) // 2
 
         results = []
 
@@ -163,45 +167,64 @@ class AudioSession:
             self.buffer = self.buffer[frame_size:]
 
             event = self.vad.process_chunk(frame)
-            self.total_audio_ms += 32  # 512 samples / 16000 * 1000 = 32ms
+            self.total_audio_ms += 32
 
             if event['event'] == 'speech_end':
                 audio = event['buffer']
-                transcription = self.engine.transcribe(audio, self.sample_rate)
-                results.append({
-                    'type': 'transcription',
-                    'text': transcription['text'],
-                    'duration_sec': transcription['duration_sec'],
-                    'inference_ms': transcription['inference_ms'],
-                })
+                transcription = self.engine.transcribe(
+                    audio,
+                    language=self.language,
+                    sample_rate=self.sample_rate
+                )
+                if transcription['text']:
+                    results.append({
+                        'type': 'transcription',
+                        'text': transcription['text'],
+                        'duration_sec': transcription['duration_sec'],
+                        'inference_ms': transcription['inference_ms'],
+                    })
             elif event['event'] == 'speech_start':
                 results.append({'type': 'speech_start'})
 
         return results
 
     def flush(self):
-        """
-        Process any remaining audio in buffer (for connection close).
-        """
-        if len(self.buffer) >= 320:  # at least 10ms
-            # Pad to minimum length and run ASR
+        """Process any remaining audio (on connection close)."""
+        if len(self.buffer) >= 320:
             audio = bytes(self.buffer)
-            transcription = self.engine.transcribe(audio, self.sample_rate)
+            transcription = self.engine.transcribe(
+                audio,
+                language=self.language,
+                sample_rate=self.sample_rate
+            )
             self.buffer.clear()
-            return [{
-                'type': 'transcription',
-                'text': transcription['text'],
-                'duration_sec': transcription['duration_sec'],
-                'inference_ms': transcription['inference_ms'],
-            }]
+            if transcription['text']:
+                return [{
+                    'type': 'transcription',
+                    'text': transcription['text'],
+                    'duration_sec': transcription['duration_sec'],
+                    'inference_ms': transcription['inference_ms'],
+                }]
         return []
+
+
+def parse_language_from_path(path: str) -> str:
+    """Extract language from WebSocket URL query string."""
+    parsed = urlparse(f"http://localhost{path}")
+    params = parse_qs(parsed.query)
+    lang = params.get('language', ['zh'])[0].lower()
+    if lang not in SUPPORTED_LANGUAGES:
+        logger.warning(f"Unsupported language '{lang}', falling back to 'zh'")
+        return 'zh'
+    return lang
 
 
 async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: SenseVoiceEngine):
     """
     Handle one WebSocket client connection.
-    
+
     Protocol:
+      - Client connects via ws://host:port/?language=zh
       - Client sends raw PCM 16kHz 16-bit mono audio as binary frames
       - Server sends JSON text frames:
         {"type": "speech_start"}
@@ -210,18 +233,22 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
         {"type": "error", "message": "..."}
     """
     client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-    logger.info(f"Client connected: {client_id}")
 
-    session = AudioSession(engine)
+    # Parse language from URL query string
+    language = parse_language_from_path(websocket.path)
+    logger.info(f"Client connected: {client_id}, language={language}, path={websocket.path}")
+
+    session = AudioSession(engine, language=language)
 
     try:
         await websocket.send(json.dumps({
             'type': 'info',
-            'message': 'Connected. Send PCM 16kHz 16-bit mono audio frames.',
+            'message': 'Connected. Send PCM 16kHz 16-bit mono audio.',
             'config': {
                 'sample_rate': session.sample_rate,
                 'model': 'SenseVoiceSmall',
                 'vad': 'silero-vad',
+                'language': language,
             }
         }))
 
@@ -231,11 +258,11 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
                 for result in results:
                     await websocket.send(json.dumps(result, ensure_ascii=False))
             else:
-                # text message - could be control commands
+                # text message — control commands
                 try:
                     cmd = json.loads(message)
                     if cmd.get('action') == 'reset':
-                        session = AudioSession(engine)
+                        session = AudioSession(engine, language=language)
                         await websocket.send(json.dumps({'type': 'info', 'message': 'Session reset'}))
                 except json.JSONDecodeError:
                     await websocket.send(json.dumps({
@@ -268,11 +295,7 @@ def parse_args():
     parser.add_argument('--model-dir', type=str, default=None,
                         help='SenseVoiceSmall model directory')
     parser.add_argument('--device', type=str, default='cuda:0',
-                        help='Device (cuda:0, cuda:1, cpu)')
-    parser.add_argument('--use-itn', action='store_true', default=True,
-                        help='Enable inverse text normalization')
-    parser.add_argument('--no-itn', action='store_false', dest='use_itn',
-                        help='Disable inverse text normalization')
+                        help='Inference device (cuda:0, cuda:1, cpu)')
     parser.add_argument('--debug', action='store_true', help='Enable debug logging')
     return parser.parse_args()
 
@@ -288,14 +311,13 @@ def main():
     logger.info("=" * 50)
     logger.info(f"Host: {args.host}:{args.port}")
     logger.info(f"Device: {args.device}")
-    logger.info(f"ITN: {args.use_itn}")
     logger.info(f"Model: {args.model_dir or 'default'}")
+    logger.info(f"Supported languages: {', '.join(sorted(SUPPORTED_LANGUAGES))}")
 
     # Initialize ASR engine (shared across all connections)
     engine = SenseVoiceEngine(
         model_dir=args.model_dir,
         device=args.device,
-        use_itn=args.use_itn,
     )
 
     # Start WebSocket server
@@ -305,7 +327,7 @@ def main():
         args.port,
         ping_interval=30,
         ping_timeout=10,
-        max_size=2**20,  # 1MB max message
+        max_size=2**20,
     )
 
     logger.info(f"Server listening on ws://{args.host}:{args.port}")

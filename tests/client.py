@@ -13,9 +13,10 @@ Usage:
   python tests/client.py mic
 
 Options:
-  --host HOST    Server host (default: localhost)
-  --port PORT    Server port (default: 8765)
-  --rate RATE    Sample rate (default: 16000)
+  --host HOST       Server host (default: localhost)
+  --port PORT       Server port (default: 8765)
+  --language LANG   Language code: zh, en, yue, ja, ko, auto (default: zh)
+  --rate RATE       Sample rate (default: 16000)
 """
 
 import asyncio
@@ -23,9 +24,12 @@ import json
 import sys
 import os
 import argparse
-import time
 
 import websockets
+
+
+def build_ws_url(host: str, port: int, language: str) -> str:
+    return f"ws://{host}:{port}/?language={language}"
 
 
 async def send_audio(websocket, audio_path: str):
@@ -41,14 +45,15 @@ async def send_audio(websocket, audio_path: str):
 
     # Read welcome message
     welcome = await websocket.recv()
-    print(f"  Server: {json.loads(welcome)['message']}")
+    info = json.loads(welcome)
+    print(f"  Server: {info['message']}  (language: {info['config']['language']})")
 
     # Send audio in chunks (simulating streaming)
     chunk_size = 3200  # 100ms of audio
     for i in range(0, len(frames), chunk_size):
         chunk = frames[i:i + chunk_size]
         await websocket.send(chunk)
-        await asyncio.sleep(0.01)  # Small delay to simulate real-time
+        await asyncio.sleep(0.01)
 
     # Wait for results
     await asyncio.sleep(0.5)
@@ -63,7 +68,7 @@ async def send_audio(websocket, audio_path: str):
         pass
 
 
-async def send_directory(host: str, port: int, directory: str, ext: str = '.wav'):
+async def send_directory(host: str, port: int, language: str, directory: str, ext: str = '.wav'):
     """Send all WAV files from a directory."""
     files = sorted([f for f in os.listdir(directory) if f.endswith(ext)])
     if not files:
@@ -71,19 +76,17 @@ async def send_directory(host: str, port: int, directory: str, ext: str = '.wav'
         return
 
     print(f"Sending {len(files)} files from {directory} ...")
-    total_time = 0
-    total_inference = 0
 
     for fname in files:
         fpath = os.path.join(directory, fname)
         try:
-            async with websockets.connect(f"ws://{host}:{port}") as ws:
+            async with websockets.connect(build_ws_url(host, port, language)) as ws:
                 await send_audio(ws, fpath)
         except Exception as e:
             print(f"  Error processing {fname}: {e}")
 
 
-async def mic_mode(host: str, port: int):
+async def mic_mode(host: str, port: int, language: str):
     """Interactive microphone mode."""
     try:
         import pyaudio
@@ -100,10 +103,10 @@ async def mic_mode(host: str, port: int):
     stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
                     input=True, frames_per_buffer=CHUNK)
 
-    async with websockets.connect(f"ws://{host}:{port}") as ws:
-        # Read welcome
+    async with websockets.connect(build_ws_url(host, port, language)) as ws:
         welcome = await ws.recv()
-        print(f"Connected: {json.loads(welcome)['message']}")
+        info = json.loads(welcome)
+        print(f"Connected: {info['message']}  (language: {info['config']['language']})")
         print("Speak into the microphone. Press Ctrl+C to stop.\n")
 
         try:
@@ -135,25 +138,27 @@ def main():
                         help='File path or directory path')
     parser.add_argument('--host', default='localhost', help='Server host')
     parser.add_argument('--port', type=int, default=8765, help='Server port')
+    parser.add_argument('--language', default='zh',
+                        help='Language code: zh, en, yue, ja, ko, auto (default: zh)')
     parser.add_argument('--rate', type=int, default=16000, help='Sample rate')
 
     args = parser.parse_args()
 
     if args.mode == 'mic':
-        asyncio.run(mic_mode(args.host, args.port))
+        asyncio.run(mic_mode(args.host, args.port, args.language))
     elif args.mode == 'send':
         if not args.path:
             print("Error: path required for 'send' mode")
             sys.exit(1)
         async def _send():
-            async with websockets.connect(f"ws://{args.host}:{args.port}") as ws:
+            async with websockets.connect(build_ws_url(args.host, args.port, args.language)) as ws:
                 await send_audio(ws, args.path)
         asyncio.run(_send())
     elif args.mode == 'dir':
         if not args.path:
             print("Error: path required for 'dir' mode")
             sys.exit(1)
-        asyncio.run(send_directory(args.host, args.port, args.path))
+        asyncio.run(send_directory(args.host, args.port, args.language, args.path))
 
 
 if __name__ == '__main__':

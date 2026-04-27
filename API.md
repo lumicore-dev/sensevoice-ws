@@ -7,28 +7,49 @@ Version 1.0 | Protocol: WebSocket | Audio: PCM 16kHz 16-bit Mono
 ## 1. Connection
 
 ```
-ws://<host>:8765/
+ws://<host>:8765/?language=zh
 ```
 
-On connect, the server sends an **info** message:
+The `language` parameter is optional. Default is `zh`.
+
+On connect, the server responds with an **info** message:
 
 ```json
 {
   "type": "info",
-  "message": "Connected. Send PCM 16kHz 16-bit mono audio frames.",
+  "message": "Connected. Send PCM 16kHz 16-bit mono audio.",
   "config": {
     "sample_rate": 16000,
     "model": "SenseVoiceSmall",
-    "vad": "silero-vad"
+    "vad": "silero-vad",
+    "language": "zh"
   }
 }
 ```
 
 ---
 
-## 2. Client → Server Messages
+## 2. Language
 
-### 2.1 Audio Data (Binary Frame)
+Specify language via URL query string when connecting:
+
+| Code | Language | Example |
+|------|----------|---------|
+| `zh` | Chinese (Mandarin) | `ws://host:8765/?language=zh` |
+| `en` | English | `ws://host:8765/?language=en` |
+| `yue` | Cantonese | `ws://host:8765/?language=yue` |
+| `ja` | Japanese | `ws://host:8765/?language=ja` |
+| `ko` | Korean | `ws://host:8765/?language=ko` |
+| `auto` | Automatic detection | `ws://host:8765/?language=auto` |
+
+- Chinese mode (`zh`) also handles Chinese-English mixed speech naturally.
+- If an unsupported code is provided, the server falls back to `zh` and logs a warning.
+
+---
+
+## 3. Client → Server Messages
+
+### 3.1 Audio Data (Binary Frame)
 
 Send raw audio as **WebSocket binary frames**.
 
@@ -49,7 +70,9 @@ import websockets
 import wave
 
 async def send_audio(file_path):
-    async with websockets.connect("ws://server:8765") as ws:
+    async with websockets.connect(
+        "ws://server:8765/?language=zh"
+    ) as ws:
         # Read welcome
         welcome = await ws.recv()
 
@@ -67,7 +90,7 @@ async def send_audio(file_path):
             print(msg)
 ```
 
-### 2.2 Control Commands (Text Frame)
+### 3.2 Control Commands (Text Frame)
 
 | Command | Description |
 |---------|-------------|
@@ -75,11 +98,11 @@ async def send_audio(file_path):
 
 ---
 
-## 3. Server → Client Messages
+## 4. Server → Client Messages
 
 All messages are JSON-encoded text frames.
 
-### 3.1 `info`
+### 4.1 `info`
 
 Sent on connection or after a reset.
 
@@ -90,7 +113,7 @@ Sent on connection or after a reset.
 }
 ```
 
-### 3.2 `speech_start`
+### 4.2 `speech_start`
 
 Sent when VAD detects the beginning of a speech segment.
 
@@ -100,7 +123,9 @@ Sent when VAD detects the beginning of a speech segment.
 }
 ```
 
-### 3.3 `transcription`
+The client can use this signal to update UI (e.g., show a listening indicator).
+
+### 4.3 `transcription`
 
 Sent when VAD detects the end of a speech segment and ASR completes.
 
@@ -115,11 +140,15 @@ Sent when VAD detects the end of a speech segment and ASR completes.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `text` | string | Transcribed text (with ITN applied) |
-| `duration_sec` | number | Audio duration in seconds |
+| `text` | string | Recognized text output (raw, no formatting applied) |
+| `duration_sec` | number | Audio duration of this utterance in seconds |
 | `inference_ms` | number | Model inference time in milliseconds |
 
-### 3.4 `error`
+Notes:
+- The output text is raw ASR output without inverse text normalization (ITN). Numbers and punctuation are passed as-is, intended for downstream LLM processing.
+- If the utterance contains no detectable speech, no `transcription` message is sent.
+
+### 4.4 `error`
 
 ```json
 {
@@ -130,21 +159,24 @@ Sent when VAD detects the end of a speech segment and ASR completes.
 
 ---
 
-## 4. Integration Examples
+## 5. Integration Examples
 
 ### JavaScript / Browser
 
 ```javascript
-const ws = new WebSocket('ws://server:8765');
+const ws = new WebSocket('ws://server:8765/?language=zh');
 
 ws.onopen = () => {
   console.log('Connected');
 };
 
 ws.onmessage = (event) => {
-  if (event.data instanceof Blob) return; // ignore binary echo
+  if (event.data instanceof Blob) return;
   const msg = JSON.parse(event.data);
-  if (msg.type === 'transcription') {
+
+  if (msg.type === 'speech_start') {
+    console.log('Listening...');
+  } else if (msg.type === 'transcription') {
     console.log('Recognized:', msg.text);
   }
 };
@@ -160,11 +192,14 @@ navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
 
 ```python
 import asyncio
+import json
 import websockets
 import pyaudio
 
 async def microphone_client():
-    async with websockets.connect("ws://server:8765") as ws:
+    async with websockets.connect(
+        "ws://server:8765/?language=zh"
+    ) as ws:
         welcome = await ws.recv()
         p = pyaudio.PyAudio()
         stream = p.open(
@@ -184,8 +219,10 @@ async def microphone_client():
         async def recv_results():
             async for msg in ws:
                 data = json.loads(msg)
-                if data['type'] == 'transcription':
-                    print(f"[{data['text']}]")
+                if data['type'] == 'speech_start':
+                    print("[listening...]", end=" ", flush=True)
+                elif data['type'] == 'transcription':
+                    print(f"\n[{data['text']}]")
 
         await asyncio.gather(send_audio(), recv_results())
 ```
@@ -193,11 +230,9 @@ async def microphone_client():
 ### C (using libwebsockets)
 
 ```c
-// See examples/c_client.c for a complete C implementation
-// Key points:
-//   - Connect to ws://server:8765
-//   - Send raw PCM 16-bit 16kHz as binary frames via LWS_WRITE_BINARY
-//   - Receive text frames and parse JSON
+// Connect to ws://server:8765/?language=zh
+// Send raw PCM 16-bit 16kHz as binary frames via LWS_WRITE_BINARY
+// Receive text frames and parse JSON
 ```
 
 ### curl (Not supported)
@@ -206,7 +241,7 @@ WebSocket protocol is required. HTTP-based endpoints are not available.
 
 ---
 
-## 5. Audio Preprocessing
+## 6. Audio Preprocessing
 
 Before sending audio to the server, ensure the format matches:
 
@@ -231,49 +266,73 @@ ffmpeg -i input.mp3 -ac 1 -ar 16000 -sample_fmt s16 output.wav
 
 ---
 
-## 6. Session Lifecycle
+## 7. Session Lifecycle
 
 ```
-Client connects
+Client connects  ws://host:8765/?language=zh
   ↓
-Server sends 'info'
+Server sends 'info'  (config + language confirmation)
   ↓
-┌─────────────────────────────────────────────┐
-│  [Client sends PCM chunks]                   │
-│    ↓                                         │
-│  VAD detects speech → 'speech_start'         │
-│    ↓                                         │
-│  VAD detects silence → ASR inference         │
-│    ↓                                         │
-│  Server sends 'transcription'                │
-│    ↓                                         │
-│  [Client continues sending]                  │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  [Client sends PCM chunks continuously]         │
+│    ↓                                            │
+│  VAD detects speech ──→ 'speech_start'          │
+│    ↓                                            │
+│  VAD detects silence ──→ ASR inference          │
+│    ↓                                            │
+│  Server sends 'transcription'  (per utterance)  │
+│    ↓                                            │
+│  [Client continues sending audio]               │
+│    ...                                          │
+│  VAD detects next utterance ──→ next result     │
+└────────────────────────────────────────────────┘
   ↓
 Client disconnects
   ↓
 Server flushes remaining audio, sends final results
 ```
 
+The client keeps a persistent WebSocket connection for the entire session. No reconnection is needed between utterances.
+
 ---
 
-## 7. Error Handling
+## 8. VAD (Voice Activity Detection)
+
+The server uses **silero-vad** to detect utterance boundaries.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Model | silero-vad v5 | Lightweight (1.7MB), high accuracy |
+| Threshold | 0.5 | Speech probability threshold |
+| Grace period | 600ms | Silence duration before utterance end |
+| Frame size | 512 samples | 32ms at 16kHz |
+
+How it works:
+- Audio is processed in 32ms frames
+- When speech probability exceeds 0.5, utterance starts
+- When speech stays below 0.5 for 600ms, utterance ends and ASR triggers
+- The server sends `speech_start` and `transcription` events accordingly
+
+---
+
+## 9. Error Handling
 
 | Scenario | Behavior |
 |----------|----------|
 | No speech detected | No `transcription` sent for that segment |
 | Audio too short (< 10ms) | Ignored, no transcription |
 | Invalid audio format | Server may produce poor results; no error returned |
-| Connection lost mid-utterance | Remaining audio is processed on `close` |
+| Connection lost mid-utterance | Remaining audio is processed on close |
+| Unsupported language code | Server falls back to `zh`, logs warning |
 | Server overloaded | Connections are queued; all share one GPU model |
 
 ---
 
-## 8. Performance
+## 10. Performance
 
 | Metric | Typical Value |
 |--------|---------------|
-| End-to-end latency (utterance) | 300–800 ms |
+| End-to-end latency (per utterance) | 300–800 ms |
 | Audio chunk interval | 32–200 ms (per binary frame) |
 | Max concurrent connections | ~10–20 per GPU |
 | GPU memory usage | ~1–2 GB |
@@ -281,7 +340,7 @@ Server flushes remaining audio, sends final results
 
 ---
 
-## 9. Repository
+## 11. Repository
 
 - **GitHub**: https://github.com/lumicore-dev/sensevoice-ws
 - **License**: MIT (SenseVoiceSmall) / MIT (silero-vad)

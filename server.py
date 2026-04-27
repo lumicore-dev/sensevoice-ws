@@ -25,10 +25,6 @@ EOF Protocol:
   without waiting for VAD silence detection. Useful for push-to-talk apps
   where the user releases the button to indicate end-of-speech.
 
-  Fallback: If VAD already triggered speech_end (600ms of silence), only
-  residual audio (< 50ms) remains in the buffer. In that case, the last
-  VAD-triggered transcription result is re-sent as the final result.
-
 Requirements:
   - funasr
   - torch
@@ -160,9 +156,8 @@ class AudioSession:
         self.buffer = bytearray()
         self.samples_accumulated = 0
         self.total_audio_ms = 0
-        # Stores the last VAD-triggered transcription result.
-        # When EOF arrives and VAD has already triggered speech_end (leaving
-        # only residual audio < 50ms), this result is re-sent.
+        # Stores the last VAD-triggered transcription result for EOF fallback.
+        # Cleared after use to prevent duplicate delivery.
         self.last_vad_result = None
 
     def reset(self):
@@ -171,7 +166,8 @@ class AudioSession:
         self.buffer.clear()
         self.samples_accumulated = 0
         self.total_audio_ms = 0
-        # Do NOT clear last_vad_result — persists for EOF fallback
+        # NOTE: last_vad_result persists intentionally — it's cleared by
+        # force_transcribe() / flush() after fallback use, not by reset().
 
     async def feed_audio(self, chunk: bytes):
         """
@@ -224,7 +220,7 @@ class AudioSession:
         - If substantial buffered audio (> 50ms / 1600 bytes), transcribe fresh.
         - If only residual audio (<= 50ms) remains (VAD already triggered
           speech_end), falls back to last_vad_result.
-        - If nothing available, returns None.
+        - Fallback result is cleared after use to prevent duplicate delivery.
 
         Returns:
             dict with transcription result, or None if nothing available.
@@ -245,18 +241,23 @@ class AudioSession:
                 sample_rate=self.sample_rate
             )
             if transcription['text']:
-                return {
+                result = {
                     'type': 'transcription',
                     'text': transcription['text'],
                     'duration_sec': transcription['duration_sec'],
                     'inference_ms': transcription['inference_ms'],
                 }
+                # New transcription supersedes any previous VAD result
+                self.last_vad_result = None
+                return result
 
-        # Audio too short or no text — fall back to VAD result
+        # Audio too short or no text — fall back to VAD result (once only)
         if self.last_vad_result:
             logger.info(f"force_transcribe: residual audio ({len(full_audio) if full_audio else 0} bytes), "
                         f"re-sending last VAD result: '{self.last_vad_result['text']}'")
-            return self.last_vad_result
+            result = self.last_vad_result
+            self.last_vad_result = None  # ← Clear to prevent duplicate delivery
+            return result
 
         logger.info("force_transcribe: no audio and no VAD result available")
         return None
@@ -279,6 +280,7 @@ class AudioSession:
                 sample_rate=self.sample_rate
             )
             if transcription['text']:
+                self.last_vad_result = None
                 return [{
                     'type': 'transcription',
                     'text': transcription['text'],
@@ -288,7 +290,9 @@ class AudioSession:
 
         if self.last_vad_result:
             logger.info(f"flush: re-sending last VAD result: '{self.last_vad_result['text']}'")
-            return [self.last_vad_result]
+            result = self.last_vad_result
+            self.last_vad_result = None  # ← Clear to prevent duplicate delivery
+            return [result]
 
         return []
 
@@ -370,7 +374,7 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
                         # Signal that EOF processing is complete
                         await websocket.send(json.dumps({'type': 'done'}))
                         logger.info(f"Sent 'done' to {client_id} (total={elapsed_ms:.1f}ms)")
-                        # Reset for next utterance (preserves last_vad_result)
+                        # Reset for next utterance (last_vad_result already cleared by force_transcribe)
                         session.reset()
 
                 except json.JSONDecodeError:

@@ -1,0 +1,19 @@
+# SenseVoice WebSocket ASR Server Configuration
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+  max_message_size: 1048576  # 1MB
+
+model:
+  device: "cuda:0"         # "cuda:0", "cuda:1", or "cpu"
+  use_itn: true            # Inverse Text Normalization
+  model_dir: null          # null = use default cache path
+
+vad:
+  sample_rate: 16000
+  threshold: 0.5           # Speech probability threshold
+  grace_period_ms: 600     # Silence timeout before utterance end
+
+logging:
+  level: "INFO"            # DEBUG, INFO, WARNING, ERROR

@@ -16,7 +16,14 @@ Clients can specify language via URL query string:
   ws://host:8765/?language=zh
   ws://host:8765/?language=en
   ws://host:8765/?language=yue
+  ws://host:8765/?language=ja
+  ws://host:8765/?language=ko
   ws://host:8765/?language=auto
+
+EOF Protocol:
+  Client sends {"action": "eof"} to immediately transcribe buffered audio
+  without waiting for VAD silence detection. Useful for push-to-talk apps
+  where the user releases the button to indicate end-of-speech.
 
 Requirements:
   - funasr
@@ -151,6 +158,13 @@ class AudioSession:
         self.samples_accumulated = 0
         self.total_audio_ms = 0
 
+    def reset(self):
+        """Reset VAD and audio buffer for a new utterance."""
+        self.vad.reset()
+        self.buffer.clear()
+        self.samples_accumulated = 0
+        self.total_audio_ms = 0
+
     async def feed_audio(self, chunk: bytes):
         """
         Feed incoming audio chunk. Returns list of result events.
@@ -187,6 +201,39 @@ class AudioSession:
                 results.append({'type': 'speech_start'})
 
         return results
+
+    async def force_transcribe(self) -> dict:
+        """
+        Immediately transcribe all buffered audio (triggered by EOF signal).
+        Bypasses VAD grace period — returns result right away.
+
+        Returns:
+            dict with transcription result, or None if audio is too short.
+        """
+        # Collect remaining partial VAD frame + any speech buffer
+        partial_frame = bytes(self.buffer)
+        self.buffer.clear()
+
+        speech_audio = self.vad.force_flush()
+
+        full_audio = partial_frame + speech_audio
+
+        if not full_audio or len(full_audio) < 320:
+            return None
+
+        transcription = self.engine.transcribe(
+            full_audio,
+            language=self.language,
+            sample_rate=self.sample_rate
+        )
+        if transcription['text']:
+            return {
+                'type': 'transcription',
+                'text': transcription['text'],
+                'duration_sec': transcription['duration_sec'],
+                'inference_ms': transcription['inference_ms'],
+            }
+        return None
 
     def flush(self):
         """Process any remaining audio (on connection close)."""
@@ -226,9 +273,11 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
     Protocol:
       - Client connects via ws://host:port/?language=zh
       - Client sends raw PCM 16kHz 16-bit mono audio as binary frames
+      - Client may send {"action": "eof"} to force immediate transcription
       - Server sends JSON text frames:
         {"type": "speech_start"}
         {"type": "transcription", "text": "...", "duration_sec": 1.23, "inference_ms": 45.6}
+        {"type": "done"}  (after EOF transcription is complete)
         {"type": "info", "message": "..."}
         {"type": "error", "message": "..."}
     """
@@ -261,9 +310,22 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
                 # text message — control commands
                 try:
                     cmd = json.loads(message)
-                    if cmd.get('action') == 'reset':
+                    action = cmd.get('action')
+
+                    if action == 'reset':
                         session = AudioSession(engine, language=language)
                         await websocket.send(json.dumps({'type': 'info', 'message': 'Session reset'}))
+
+                    elif action == 'eof':
+                        # Force transcribe buffered audio immediately
+                        result = await session.force_transcribe()
+                        if result:
+                            await websocket.send(json.dumps(result, ensure_ascii=False))
+                        # Signal that EOF processing is complete
+                        await websocket.send(json.dumps({'type': 'done'}))
+                        # Reset for next utterance
+                        session.reset()
+
                 except json.JSONDecodeError:
                     await websocket.send(json.dumps({
                         'type': 'error',

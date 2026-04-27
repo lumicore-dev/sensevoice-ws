@@ -46,6 +46,18 @@ class VoiceActivityDetector:
         self.silent_count = 0
         self.speech_buffer = []
 
+    def force_flush(self) -> bytes:
+        """
+        Immediately return all accumulated speech audio regardless of VAD state.
+        Resets the VAD state afterwards. Used for explicit EOF from client.
+
+        Returns:
+            bytes: Accumulated speech audio (empty if no speech was detected)
+        """
+        audio = b''.join(self.speech_buffer)
+        self.reset()
+        return audio
+
     def process_chunk(self, audio_chunk: bytes) -> dict:
         """
         Process a PCM chunk (must be 512 samples = 32ms at 16kHz).

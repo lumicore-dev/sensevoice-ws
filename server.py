@@ -365,12 +365,13 @@ class AudioSession:
                 return result
 
         # Audio too short or no text — fall back to VAD result (once only)
+        # IMPORTANT: Don't re-send last_vad_result here — it was already sent
+        # to the client by feed_audio() when VAD triggered speech_end.
         if self.last_vad_result:
             logger.info(f"force_transcribe: residual audio ({len(full_audio) if full_audio else 0} bytes), "
-                        f"re-sending last VAD result: '{self.last_vad_result['text']}'")
-            result = self.last_vad_result
-            self.last_vad_result = None  # ← Clear to prevent duplicate delivery
-            return result
+                        f"last VAD result already sent to client, skipping duplicate")
+            self.last_vad_result = None  # Clear to prevent stale fallback
+            return None
 
         logger.info("force_transcribe: no audio and no VAD result available")
         return None
@@ -402,10 +403,9 @@ class AudioSession:
                 }]
 
         if self.last_vad_result:
-            logger.info(f"flush: re-sending last VAD result: '{self.last_vad_result['text']}'")
-            result = self.last_vad_result
-            self.last_vad_result = None  # ← Clear to prevent duplicate delivery
-            return [result]
+            logger.info(f"flush: last VAD result already sent to client, skipping duplicate")
+            self.last_vad_result = None
+            return []
 
         return []
 

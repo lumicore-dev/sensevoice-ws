@@ -12,13 +12,8 @@ Architecture:
 Usage:
   python server.py --host 0.0.0.0 --port 8765
 
-Clients can specify language via URL query string:
-  ws://host:8765/?language=zh
-  ws://host:8765/?language=en
-  ws://host:8765/?language=yue
-  ws://host:8765/?language=ja
-  ws://host:8765/?language=ko
-  ws://host:8765/?language=auto
+Clients can specify parameters via URL query string:
+  ws://host:8765/?language=zh&use_itn=true
 
 EOF Protocol:
   Client sends {"action": "eof"} to immediately transcribe buffered audio
@@ -54,7 +49,84 @@ logging.basicConfig(
 logger = logging.getLogger('sensevoice-ws')
 
 # Supported language codes
-SUPPORTED_LANGUAGES = {'zh', 'en', 'yue', 'ja', 'ko', 'auto'}
+SUPPORTED_LANGUAGES = {'zh', 'en', 'yue', 'ja', 'ko', 'auto', 'nospeech'}
+
+# Default values for all session parameters (matches API.md v2.0)
+DEFAULT_PARAMS = {
+    # SenseVoice ASR
+    'language': 'zh',
+    'use_itn': False,
+    'ban_emo_unk': False,
+    'batch_size_s': 60,
+    'merge_vad': False,
+    'merge_length_s': 15,
+    # Output post-processing
+    'rich_postprocess': False,
+    # VAD
+    'vad_threshold': 0.5,
+    'vad_grace_period_ms': 600,
+    'ptt_mode': False,
+    # Audio
+    'sample_rate': 16000,
+}
+
+# Types for each parameter (for conversion)
+PARAM_TYPES = {
+    'language': str,
+    'use_itn': bool,
+    'ban_emo_unk': bool,
+    'batch_size_s': int,
+    'merge_vad': bool,
+    'merge_length_s': int,
+    'rich_postprocess': bool,
+    'vad_threshold': float,
+    'vad_grace_period_ms': int,
+    'ptt_mode': bool,
+    'sample_rate': int,
+}
+
+
+# ---------------------------------------------------------------------------
+# Parameter Parsing
+# ---------------------------------------------------------------------------
+
+def parse_params_from_path(path: str) -> dict:
+    """
+    Extract all session parameters from WebSocket URL query string.
+    Returns a dict with all keys from DEFAULT_PARAMS, overridden by any
+    values present in the query string.
+    """
+    parsed = urlparse(f"http://localhost{path}")
+    query_params = parse_qs(parsed.query)
+
+    params = dict(DEFAULT_PARAMS)
+
+    for key, default_val in DEFAULT_PARAMS.items():
+        if key in query_params:
+            raw = query_params[key][0]
+            param_type = PARAM_TYPES[key]
+            try:
+                if param_type == bool:
+                    # Accept 'true'/'false', '1'/'0', 'yes'/'no'
+                    params[key] = raw.lower() in ('true', '1', 'yes')
+                else:
+                    params[key] = param_type(raw)
+            except (ValueError, TypeError):
+                logger.warning(f"Invalid value for '{key}': '{raw}', using default '{default_val}'")
+                params[key] = default_val
+
+    # Validate language
+    if params['language'] not in SUPPORTED_LANGUAGES:
+        logger.warning(f"Unsupported language '{params['language']}', falling back to 'zh'")
+        params['language'] = 'zh'
+
+    # Validate sample_rate
+    if params['sample_rate'] not in (8000, 16000):
+        logger.warning(f"Unsupported sample_rate '{params['sample_rate']}', falling back to 16000")
+        params['sample_rate'] = 16000
+
+    return params
+
 
 # ---------------------------------------------------------------------------
 # ASR Engine
@@ -69,6 +141,7 @@ class SenseVoiceEngine:
     def __init__(self, model_dir: str = None, device: str = 'cuda:0'):
         self.device = device
         self.model = None
+        self.postprocess_fn = None
         self.model_dir = model_dir or os.environ.get(
             'SENSEVOICE_MODEL_DIR',
             '/home/zhyi/.cache/modelscope/hub/iic/SenseVoiceSmall'
@@ -78,6 +151,7 @@ class SenseVoiceEngine:
     def _load_model(self):
         logger.info(f"Loading SenseVoiceSmall from {self.model_dir} on {self.device} ...")
         from funasr import AutoModel
+        from funasr.utils.postprocess_utils import rich_transcription_postprocess
 
         self.model = AutoModel(
             model=self.model_dir,
@@ -85,15 +159,21 @@ class SenseVoiceEngine:
             device=self.device,
             disable_update=True,
         )
+        self.postprocess_fn = rich_transcription_postprocess
         logger.info("SenseVoiceSmall loaded successfully")
 
-    def transcribe(self, audio_bytes: bytes, language: str = 'zh', sample_rate: int = 16000) -> dict:
+    def transcribe(
+        self,
+        audio_bytes: bytes,
+        params: dict = None,
+        sample_rate: int = 16000,
+    ) -> dict:
         """
         Run ASR on raw PCM audio bytes.
 
         Args:
             audio_bytes: Raw PCM 16-bit mono audio data
-            language: Language code (zh, en, yue, ja, ko, auto)
+            params: Dict of session parameters (use_itn, ban_emo_unk, etc.)
             sample_rate: Audio sample rate (must match model expected rate)
 
         Returns:
@@ -102,6 +182,9 @@ class SenseVoiceEngine:
         if not audio_bytes or len(audio_bytes) < 320:  # < 10ms audio
             return {'text': '', 'duration_sec': 0, 'inference_ms': 0}
 
+        if params is None:
+            params = {}
+
         duration_sec = len(audio_bytes) / 2 / sample_rate
         t0 = time.time()
 
@@ -109,12 +192,34 @@ class SenseVoiceEngine:
         tmp_path = f'/dev/shm/_sensevoice_tmp_{id(audio_bytes)}.wav'
         try:
             self._write_wav(tmp_path, audio_bytes, sample_rate)
-            res = self.model.generate(
-                input=tmp_path,
-                language=language,
-                use_itn=False,
-            )
+
+            # Build kwargs for model.generate() from params
+            generate_kwargs = {
+                'input': tmp_path,
+                'language': params.get('language', 'zh'),
+                'use_itn': params.get('use_itn', False),
+            }
+
+            # Pass optional SenseVoice params only if explicitly provided
+            if 'ban_emo_unk' in params:
+                generate_kwargs['ban_emo_unk'] = params['ban_emo_unk']
+            if 'batch_size_s' in params:
+                generate_kwargs['batch_size_s'] = params['batch_size_s']
+            if 'merge_vad' in params:
+                generate_kwargs['merge_vad'] = params['merge_vad']
+            if 'merge_length_s' in params:
+                generate_kwargs['merge_length_s'] = params['merge_length_s']
+
+            res = self.model.generate(**generate_kwargs)
             text = res[0]['text'].strip()
+
+            # Apply rich post-processing if enabled
+            if params.get('rich_postprocess', False) and self.postprocess_fn:
+                try:
+                    text = self.postprocess_fn(text)
+                except Exception as e:
+                    logger.warning(f"rich_postprocess failed: {e}")
+
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -148,11 +253,19 @@ class AudioSession:
     Accumulates chunks and runs VAD + ASR.
     """
 
-    def __init__(self, engine: SenseVoiceEngine, language: str = 'zh', sample_rate: int = 16000):
+    def __init__(self, engine: SenseVoiceEngine, params: dict = None):
+        if params is None:
+            params = dict(DEFAULT_PARAMS)
         self.engine = engine
-        self.language = language
-        self.sample_rate = sample_rate
-        self.vad = VoiceActivityDetector(sample_rate=sample_rate)
+        self.params = params
+        self.sample_rate = params.get('sample_rate', 16000)
+
+        self.vad = VoiceActivityDetector(
+            sample_rate=self.sample_rate,
+            grace_period_ms=params.get('vad_grace_period_ms', 600),
+            threshold=params.get('vad_threshold', 0.5),
+            ptt_mode=params.get('ptt_mode', False),
+        )
         self.buffer = bytearray()
         self.samples_accumulated = 0
         self.total_audio_ms = 0
@@ -192,8 +305,8 @@ class AudioSession:
                 logger.info(f"VAD speech_end: transcribing {len(audio)} bytes ({len(audio)/2/self.sample_rate:.2f}s)")
                 transcription = self.engine.transcribe(
                     audio,
-                    language=self.language,
-                    sample_rate=self.sample_rate
+                    params=self.params,
+                    sample_rate=self.sample_rate,
                 )
                 if transcription['text']:
                     result = {
@@ -237,8 +350,8 @@ class AudioSession:
             logger.info(f"force_transcribe: transcribing {len(full_audio)} bytes ({len(full_audio)/2/self.sample_rate:.2f}s)")
             transcription = self.engine.transcribe(
                 full_audio,
-                language=self.language,
-                sample_rate=self.sample_rate
+                params=self.params,
+                sample_rate=self.sample_rate,
             )
             if transcription['text']:
                 result = {
@@ -276,8 +389,8 @@ class AudioSession:
             logger.info(f"flush: transcribing {len(full_audio)} bytes on disconnect")
             transcription = self.engine.transcribe(
                 full_audio,
-                language=self.language,
-                sample_rate=self.sample_rate
+                params=self.params,
+                sample_rate=self.sample_rate,
             )
             if transcription['text']:
                 self.last_vad_result = None
@@ -297,49 +410,42 @@ class AudioSession:
         return []
 
 
-def parse_language_from_path(path: str) -> str:
-    """Extract language from WebSocket URL query string."""
-    parsed = urlparse(f"http://localhost{path}")
-    params = parse_qs(parsed.query)
-    lang = params.get('language', ['zh'])[0].lower()
-    if lang not in SUPPORTED_LANGUAGES:
-        logger.warning(f"Unsupported language '{lang}', falling back to 'zh'")
-        return 'zh'
-    return lang
-
-
 async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: SenseVoiceEngine):
     """
     Handle one WebSocket client connection.
 
     Protocol:
-      - Client connects via ws://host:port/?language=zh
+      - Client connects via ws://host:port/?language=zh&use_itn=true&...
       - Client sends raw PCM 16kHz 16-bit mono audio as binary frames
       - Client may send {"action": "eof"} to force immediate transcription
+      - Client may send {"action": "config", "language": "en", "use_itn": true} to update params mid-session
       - Server sends JSON text frames:
         {"type": "speech_start"}
         {"type": "transcription", "text": "...", "duration_sec": 1.23, "inference_ms": 45.6}
         {"type": "done"}  (after EOF transcription is complete)
-        {"type": "info", "message": "..."}
+        {"type": "info", "message": "...", "config": {...}}
         {"type": "error", "message": "..."}
     """
     client_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
 
-    # Parse language from URL query string
-    language = parse_language_from_path(websocket.path)
-    logger.info(f"Client connected: {client_id}, language={language}, path={websocket.path}")
+    # Parse all parameters from URL query string
+    params = parse_params_from_path(websocket.path)
+    logger.info(f"Client connected: {client_id}, path={websocket.path}")
 
-    session = AudioSession(engine, language=language)
+    # Log resolved params
+    param_log = {k: v for k, v in params.items() if k != 'language'}
+    logger.info(f"Client config: {client_id}, language={params['language']}, params={param_log}")
+
+    session = AudioSession(engine, params=params)
 
     try:
         await websocket.send(json.dumps({
             'type': 'info',
             'message': 'Connected. Send PCM 16kHz 16-bit mono audio.',
             'config': {
-                'sample_rate': session.sample_rate,
                 'model': 'SenseVoiceSmall',
                 'vad': 'silero-vad',
-                'language': language,
+                **params,
             }
         }))
 
@@ -350,13 +456,34 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
                     await websocket.send(json.dumps(result, ensure_ascii=False))
             else:
                 # text message — control commands
+                logger.info(f"Received text from {client_id}: {message}")
                 try:
                     cmd = json.loads(message)
                     action = cmd.get('action')
 
                     if action == 'reset':
-                        session = AudioSession(engine, language=language)
+                        session = AudioSession(engine, params=params)
                         await websocket.send(json.dumps({'type': 'info', 'message': 'Session reset'}))
+
+                    elif action == 'config':
+                        # Update session parameters mid-session
+                        # Parameters can be at top level OR nested under "params" key
+                        config_source = cmd.get('params', cmd)
+                        for key in DEFAULT_PARAMS:
+                            if key in config_source:
+                                session.params[key] = config_source[key]
+                        # Recreate VAD if VAD params changed
+                        session.vad = VoiceActivityDetector(
+                            sample_rate=session.params.get('sample_rate', 16000),
+                            grace_period_ms=session.params.get('vad_grace_period_ms', 600),
+                            threshold=session.params.get('vad_threshold', 0.5),
+                            ptt_mode=session.params.get('ptt_mode', False),
+                        )
+                        await websocket.send(json.dumps({
+                            'type': 'info',
+                            'message': 'Config updated',
+                            'config': dict(session.params),
+                        }))
 
                     elif action == 'eof':
                         t_eof = time.perf_counter()
@@ -387,6 +514,8 @@ async def handle_client(websocket: websockets.WebSocketServerProtocol, engine: S
         logger.info(f"Client disconnected: {client_id}")
     except Exception as e:
         logger.error(f"Error handling client {client_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
     finally:
         # Flush remaining audio
         remaining = session.flush()

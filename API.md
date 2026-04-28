@@ -166,7 +166,7 @@ Only the following keys can be changed mid-session:
 - `rich_postprocess`
 - `ptt_mode`
 
-VAD parameters (`vad_threshold`, `vad_grace_period_ms`, `sample_rate`) and `batch_size_s` are **fixed at connection time** — changing them requires reconnecting.
+VAD parameters (`vad_threshold`, `vad_grace_period_ms`, `ptt_mode`) can also be changed mid-session — the server recreates the VAD engine with the new values. `sample_rate` and `batch_size_s` are fixed at connection time and cannot be changed via `config`.
 
 #### 4.2.3 `reset` — Reset Session
 

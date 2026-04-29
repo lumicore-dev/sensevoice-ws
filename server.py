@@ -317,6 +317,7 @@ class AudioSession:
                     }
                     # Save for EOF fallback
                     self.last_vad_result = result
+                    logger.info(f"VAD result: {result['text'][:50]} ({result['inference_ms']}ms)")
                     results.append(result)
                 else:
                     logger.info("VAD speech_end: no text in transcription")

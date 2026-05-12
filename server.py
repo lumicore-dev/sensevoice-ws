@@ -504,7 +504,7 @@ class AudioSession:
                     # 第二步：如果没有触发注册，做自动声纹匹配
                     if '我要注册' not in transcription['text']:
                         vp_match = await self._best_match(audio)
-                        if vp_match and vp_match["similarity"] <= 0.5:
+                        if vp_match and vp_match["similarity"] <= 0.57:
                             vp_match["name"] = "unknown"
                             vp_match["passed"] = False
                         if vp_match:
@@ -557,7 +557,7 @@ class AudioSession:
                 # 自动匹配（如果没有触发注册）
                 if '我要注册' not in transcription['text']:
                     vp_match = await self._best_match(full_audio)
-                    if vp_match and vp_match["similarity"] <= 0.5:
+                    if vp_match and vp_match["similarity"] <= 0.57:
                         vp_match["name"] = "unknown"
                         vp_match["passed"] = False
                     if vp_match:
